@@ -1,68 +1,148 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
-  "reflect"
-
-	"github.com/pingcap/tidb/parser"
-	"github.com/pingcap/tidb/parser/ast"
-	"github.com/pingcap/tidb/parser/test_driver"
+	"io"
+	"os"
 )
 
-func parse(sql string) (*ast.StmtNode, error) {
-	p := parser.New()
-
-	stmtNodes, _, err := p.Parse(sql, "", "")
-	if err != nil {
-		return nil, err
-	}
-
-	return &stmtNodes[0], nil
-}
-
 func main() {
-	astNode, err := parse("INSERT INTO customers (id, name) VALUES (1, \"John\");")
-	if err != nil {
-		fmt.Printf("parse error: %v\n", err.Error())
-		return
+	if err := process(); err != nil {
+		fmt.Fprintf(os.Stderr, "\n\nError: %v\n", err)
+		os.Exit(1)
 	}
-	fmt.Printf("%v\n", extract(astNode))
 }
 
-type colX struct{
-	colNames []string
-  tableName string
-  columnNameListOpt []string
-  valueSym string
-  valuesList []string
-  // TableName
-  // ColumnNameListOpt
-  // ValueSym
-  // ValuesList
+func process() error {
+	reader := bufio.NewReader(os.Stdin)
+	writer := bufio.NewWriter(os.Stdout)
+
+	processor := &StreamProcessor{
+		reader: *reader,
+		writer: *writer,
+	}
+
+	for {
+		_, err := processor.ProcessLine()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+	}
+	return processor.writer.Flush()
 }
 
-func (v *colX) Enter(in ast.Node) (ast.Node, bool) {
-  switch node := in.(type) {
-  case *ast.ColumnName:
-		v.colNames = append(v.colNames, node.Name.O)
-  case *ast.TableName:
-    v.tableName = node.Name.O;
-  case *test_driver.ValueExpr:
-    fmt.Printf("type: %v\n", node.Type)
-    v.valuesList = append(v.valuesList, node.GetString())
-  }
-
-  fmt.Printf("type! %v\n", reflect.TypeOf(in))
-
-	return in, false
+type StreamProcessor struct {
+	reader bufio.Reader
+	writer bufio.Writer
 }
 
-func (v *colX) Leave(in ast.Node) (ast.Node, bool) {
-	return in, true
+func (s *StreamProcessor) ProcessLine() (bool, error) {
+	buf, err := s.reader.Peek(13)
+	if err != io.EOF && err != nil {
+		return false, err
+	}
+	if string(buf) == "INSERT INTO `" {
+		fmt.Fprintf(os.Stderr, "Processing INSERT statement\n")
+		return true, s.ProcessInsertStmt()
+	} else {
+		fmt.Fprintf(os.Stderr, "Processing non-INSERT statement\n")
+		return false, s.ProcessNotInsertStmt()
+	}
 }
 
-func extract(rootNode *ast.StmtNode) colX {
-	v := &colX{}
-	(*rootNode).Accept(v)
-	return *v
+func (s *StreamProcessor) ProcessInsertStmt() error {
+	_, err := s.reader.Discard(13)
+	if err != nil {
+		return err
+	}
+	_, err = s.writer.Write([]byte("INSERT INTO `"))
+	if err != nil {
+		return err
+	}
+
+	// table name
+	buf, err := s.reader.ReadBytes('`')
+	// TODO: includes ` in table name
+	if err != nil {
+		return err
+	}
+	tableName := string(buf[:len(buf)-1])
+	if tableName == "country" {
+		fmt.Fprintf(os.Stderr, "Processing INSERT statement for table country\n")
+	}
+	_, err = s.writer.Write(buf)
+	if err != nil {
+		return err
+	}
+
+	// " VALUES ("
+	buf, err = s.reader.Peek(9)
+	if err != nil {
+		return err
+	}
+	if string(buf) != " VALUES (" {
+		return fmt.Errorf("expected VALUES (, got %s", string(buf))
+	}
+	_, err = s.reader.Discard(9)
+	if err != nil {
+		return err
+	}
+	_, err = s.writer.Write([]byte(" VALUES ("))
+	if err != nil {
+		return err
+	}
+
+	return s.ProcessValuesInnserParentheses()
+}
+
+func (s *StreamProcessor) ProcessValuesInnserParentheses() error {
+	// TODO: implement
+	// 数値リテラル, 文字列リテラル, NULL, TRUE, FALSE
+	return s.ProcessNotInsertStmt()
+}
+
+func (s *StreamProcessor) ProcessNotInsertStmt() (err error) {
+	var line []byte
+	var isPrefix bool = true
+	for isPrefix {
+		line, isPrefix, err = s.reader.ReadLine()
+		if err == io.EOF {
+			_, err = s.writer.Write(line)
+			if err != nil {
+				return err
+			} else {
+				return io.EOF
+			}
+		} else if err != nil {
+			return err
+		}
+		_, err = s.writer.Write(line)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = s.writer.Write([]byte("\n"))
+	return
+}
+
+func readUntilDelimiters(r *bufio.Reader, delimiters ...byte) ([]byte, error) {
+	var buffer []byte
+
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+
+		for _, d := range delimiters {
+			if b == d {
+				return buffer, nil
+			}
+		}
+		buffer = append(buffer, b)
+	}
 }
