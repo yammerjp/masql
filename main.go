@@ -7,6 +7,14 @@ import (
 	"os"
 )
 
+type LiteralType int
+
+const (
+	StringLiteral LiteralType = iota
+	NumberLiteral
+	NullLiteral
+)
+
 func main() {
 	if err := process(); err != nil {
 		fmt.Fprintf(os.Stderr, "\n\nError: %v\n", err)
@@ -45,10 +53,8 @@ func (s *StreamProcessor) ProcessLine() (bool, error) {
 		return false, err
 	}
 	if string(buf) == "INSERT INTO `" {
-		fmt.Fprintf(os.Stderr, "Processing INSERT statement\n")
 		return true, s.ProcessInsertStmt()
 	} else {
-		fmt.Fprintf(os.Stderr, "Processing non-INSERT statement\n")
 		return false, s.ProcessNotInsertStmt()
 	}
 }
@@ -70,9 +76,10 @@ func (s *StreamProcessor) ProcessInsertStmt() error {
 		return err
 	}
 	tableName := string(buf[:len(buf)-1])
-	if tableName == "country" {
-		fmt.Fprintf(os.Stderr, "Processing INSERT statement for table country\n")
-	}
+
+	// TODO: check table name
+	fmt.Fprintf(os.Stderr, "table: %s\n", tableName)
+
 	_, err = s.Write(buf)
 	if err != nil {
 		return err
@@ -96,10 +103,10 @@ func (s *StreamProcessor) ProcessInsertStmt() error {
 		return err
 	}
 
-	return s.ProcessValues()
+	return s.ProcessValues(tableName)
 }
 
-func (s *StreamProcessor) ProcessRow() error {
+func (s *StreamProcessor) ProcessRow(tableName string) error {
 	b, err := s.reader.ReadByte()
 	if err != nil {
 		return err
@@ -111,8 +118,8 @@ func (s *StreamProcessor) ProcessRow() error {
 	if err != nil {
 		return err
 	}
-	for {
-		err = s.ProcessValue()
+	for i := 0; ; i++ {
+		err = s.ProcessValue(tableName, i)
 		if err != nil {
 			return err
 		}
@@ -134,7 +141,7 @@ func (s *StreamProcessor) ProcessRow() error {
 	}
 }
 
-func (s *StreamProcessor) ProcessValue() error {
+func (s *StreamProcessor) ProcessValue(tableName string, columnNum int) error {
 	for {
 		buf, err := s.reader.Peek(1)
 		if err != nil {
@@ -154,52 +161,42 @@ func (s *StreamProcessor) ProcessValue() error {
 			continue
 		case '\'', '"':
 			// 文字列リテラル
-			return s.ProcessString()
-		case '-':
+			return s.ProcessString(tableName, columnNum)
+		case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 			// 数値リテラル
-			_, err = s.reader.Discard(1)
-			if err != nil {
-				return err
-			}
-			_, err = s.Write(buf)
-			if err != nil {
-				return err
-			}
-			return s.ProcessNumber()
-		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-			return s.ProcessNumber()
+			return s.ProcessNumber(tableName, columnNum)
 		case 'N':
 			// NULL
-			buf, err := s.reader.Peek(4)
-			if err != nil {
-				return err
-			}
-			if string(buf) != "NULL" {
-				// TODO: allow without null and started with N
-				return fmt.Errorf("expected NULL, got %s", string(buf))
-			}
-			_, err = s.reader.Discard(4)
-			if err != nil {
-				return err
-			}
-			_, err = s.Write(buf)
-			if err != nil {
-				return err
-			}
-			return nil
+			// TODO: allow without null and started with N
+			return s.ProcessNull(tableName, columnNum)
 		default:
 			return fmt.Errorf("unexpected char: %s", string(buf))
 		}
 	}
 }
 
-func (s *StreamProcessor) ProcessValues() error {
+func (s *StreamProcessor) ProcessNull(tableName string, columnNum int) error {
+	buf, err := s.reader.Peek(4)
+	if err != nil {
+		return err
+	}
+	if string(buf) != "NULL" {
+		return fmt.Errorf("expected NULL, got %s", string(buf))
+	}
+	_, err = s.reader.Discard(4)
+	if err != nil {
+		return err
+	}
+	return s.WriteWithReplacement(buf, tableName, columnNum, NullLiteral)
+}
+
+func (s *StreamProcessor) ProcessValues(tableName string) error {
 	for {
 		err := s.ProcessBlanks()
 		if err != nil {
 			return err
 		}
-		err = s.ProcessRow()
+		err = s.ProcessRow(tableName)
 		if err != nil {
 			return err
 		}
@@ -236,10 +233,19 @@ func (s *StreamProcessor) ProcessValues() error {
 			return fmt.Errorf("unexpected char: %s", string(b))
 		}
 	}
-	// return s.ProcessNotInsertStmt()
 }
 
-func (s *StreamProcessor) ProcessString() error {
+func (s *StreamProcessor) WriteWithReplacement(literal []byte, tableName string, columnNum int, literalType LiteralType) error {
+	// TODO: replacement
+	fmt.Fprintf(os.Stderr, "type: %d, replacement(%s:%d): %s\n", literalType, tableName, columnNum, string(literal))
+	_, err := s.Write(literal)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *StreamProcessor) ProcessString(tableName string, columnNum int) error {
 	q, err := s.reader.ReadByte()
 	if err != nil {
 		return err
@@ -247,23 +253,16 @@ func (s *StreamProcessor) ProcessString() error {
 	if q != '\'' && q != '"' {
 		return fmt.Errorf("expected quote, got %s", string(q))
 	}
-	_, err = s.Write([]byte{q})
-	if err != nil {
-		return err
-	}
-	var literal []byte
+	var literal []byte = []byte{q}
 	for {
 		buf, err := readUntilDelimiters(&s.reader, q, '\\')
 		if err != nil {
 			return err
 		}
-		beforeDelim := buf[:len(buf)-1]
+		literal = append(literal, buf...)
 		delim := buf[len(buf)-1]
 
-		literal = append(literal, beforeDelim...)
-
 		if delim == '\\' {
-			literal = append(literal, delim)
 			b, err := s.reader.ReadByte()
 			if err != nil {
 				return err
@@ -275,29 +274,47 @@ func (s *StreamProcessor) ProcessString() error {
 			return fmt.Errorf("unexpected delimiter: %s", string(delim))
 		}
 	}
-	fmt.Fprintf(os.Stderr, "string: %s\n", string(literal))
-	_, err = s.Write(literal)
-	if err != nil {
-		return err
-	}
-	_, err = s.Write([]byte{q})
-	if err != nil {
-		return err
-	}
-	return nil
+
+	return s.WriteWithReplacement(literal, tableName, columnNum, StringLiteral)
 }
 
-func (s *StreamProcessor) ProcessNumber() error {
-	literal, err := readContinuingChars(&s.reader, '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.')
+func (s *StreamProcessor) ProcessNumber(tableName string, columnNum int) error {
+	var literal []byte
+	head, err := s.reader.Peek(1)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "number: %s\n", string(literal))
-	_, err = s.Write(literal)
+	if head[0] == '-' {
+		_, err = s.reader.Discard(1)
+		if err != nil {
+			return err
+		}
+		literal = append(literal, head[0])
+	}
+	integer, err := readContinuingChars(&s.reader, '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
 	if err != nil {
 		return err
 	}
-	return nil
+	literal = append(literal, integer...)
+
+	point, err := s.reader.Peek(1)
+	if err != nil {
+		return err
+	}
+	if point[0] == '.' {
+		_, err = s.reader.Discard(1)
+		if err != nil {
+			return err
+		}
+		literal = append(literal, point[0])
+		fraction, err := readContinuingChars(&s.reader, '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
+		if err != nil {
+			return err
+		}
+		literal = append(literal, fraction...)
+	}
+
+	return s.WriteWithReplacement(literal, tableName, columnNum, NumberLiteral)
 }
 
 func (s *StreamProcessor) ProcessBlanks() error {
