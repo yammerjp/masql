@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 type LiteralType int
@@ -15,6 +16,8 @@ const (
 	NullLiteral
 )
 
+var verbose bool = false
+
 func main() {
 	if err := process(); err != nil {
 		fmt.Fprintf(os.Stderr, "\n\nError: %v\n", err)
@@ -22,14 +25,67 @@ func main() {
 	}
 }
 
+type Instruction struct {
+	TableName string
+	ColumnNum int
+	Literal   []byte
+}
+
+func BuildInstructions() ([]Instruction, error) {
+	instructions := make([]Instruction, 0)
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		// --replace=table_name:column_num:literal
+		if strings.HasPrefix(args[i], "--replace=") {
+			replace := strings.Split(args[i][10:], ":")
+			if len(replace) != 3 {
+				return nil, fmt.Errorf("invalid replace option: %s", args[i])
+			}
+			columnNum := 0
+			fmt.Sscanf(replace[1], "%d", &columnNum)
+			instructions = append(instructions, Instruction{
+				TableName: replace[0],
+				ColumnNum: columnNum,
+				Literal:   []byte(replace[2]),
+			})
+		}
+	}
+	return instructions, nil
+}
+
+func NewStreamProcessor(reader bufio.Reader, writer bufio.Writer, instructions []Instruction) *StreamProcessor {
+	instructionMap := make(map[string]map[int][]byte, len(instructions))
+	for _, instruction := range instructions {
+		columnMap, ok := instructionMap[instruction.TableName]
+		if !ok {
+			columnMap = make(map[int][]byte)
+			instructionMap[instruction.TableName] = columnMap
+		}
+		columnMap[instruction.ColumnNum] = instruction.Literal
+	}
+	return &StreamProcessor{
+		reader:       reader,
+		writer:       writer,
+		instructions: instructionMap,
+	}
+}
+
 func process() error {
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--verbose" {
+			verbose = true
+		}
+	}
+	instructions, err := BuildInstructions()
+	if err != nil {
+		return err
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
 
-	processor := &StreamProcessor{
-		reader: *reader,
-		writer: *writer,
-	}
+	processor := NewStreamProcessor(*reader, *writer, instructions)
 
 	for {
 		err := processor.ProcessLine()
@@ -43,8 +99,9 @@ func process() error {
 }
 
 type StreamProcessor struct {
-	reader bufio.Reader
-	writer bufio.Writer
+	reader       bufio.Reader
+	writer       bufio.Writer
+	instructions map[string]map[int][]byte
 }
 
 const insertStmtPrefix = "INSERT INTO `"
@@ -339,9 +396,19 @@ func (s *StreamProcessor) ProcessNumber(tableName string, columnNum int) error {
 	return s.WriteWithReplacement(literal, tableName, columnNum, NumberLiteral)
 }
 
+func debugPrint(format string, a ...interface{}) {
+	if verbose {
+		fmt.Fprintf(os.Stderr, format, a...)
+	}
+}
+
 func (s *StreamProcessor) WriteWithReplacement(literal []byte, tableName string, columnNum int, literalType LiteralType) error {
-	// TODO: replacement
-	fmt.Fprintf(os.Stderr, "type: %d, replacement(%s:%d): %s\n", literalType, tableName, columnNum, string(literal))
+	replacementLiteral, ok := s.instructions[tableName][columnNum]
+	if ok {
+		debugPrint("literal: %s -> %s\n", string(literal), string(replacementLiteral))
+		return s.Write(replacementLiteral)
+	}
+	debugPrint("literal: %s\n", string(literal))
 	return s.Write(literal)
 }
 
