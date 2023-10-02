@@ -32,7 +32,7 @@ func process() error {
 	}
 
 	for {
-		_, err := processor.ProcessLine()
+		err := processor.ProcessLine()
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -47,15 +47,17 @@ type StreamProcessor struct {
 	writer bufio.Writer
 }
 
-func (s *StreamProcessor) ProcessLine() (bool, error) {
+const insertStmtPrefix = "INSERT INTO `"
+
+func (s *StreamProcessor) ProcessLine() error {
 	buf, err := s.reader.Peek(13)
 	if err != io.EOF && err != nil {
-		return false, err
+		return err
 	}
-	if string(buf) == "INSERT INTO `" {
-		return true, s.ProcessInsertStmt()
+	if string(buf) == insertStmtPrefix {
+		return s.ProcessInsertStmt()
 	} else {
-		return false, s.ProcessNotInsertStmt()
+		return s.ProcessNotInsertStmt()
 	}
 }
 
@@ -64,7 +66,7 @@ func (s *StreamProcessor) ProcessInsertStmt() error {
 	if err != nil {
 		return err
 	}
-	_, err = s.Write([]byte("INSERT INTO `"))
+	err = s.Write([]byte(insertStmtPrefix))
 	if err != nil {
 		return err
 	}
@@ -77,10 +79,7 @@ func (s *StreamProcessor) ProcessInsertStmt() error {
 	}
 	tableName := string(buf[:len(buf)-1])
 
-	// TODO: check table name
-	fmt.Fprintf(os.Stderr, "table: %s\n", tableName)
-
-	_, err = s.Write(buf)
+	err = s.Write(buf)
 	if err != nil {
 		return err
 	}
@@ -98,7 +97,7 @@ func (s *StreamProcessor) ProcessInsertStmt() error {
 	if err != nil {
 		return err
 	}
-	_, err = s.Write([]byte(valuesPrefix))
+	err = s.Write([]byte(valuesPrefix))
 	if err != nil {
 		return err
 	}
@@ -106,88 +105,29 @@ func (s *StreamProcessor) ProcessInsertStmt() error {
 	return s.ProcessValues(tableName)
 }
 
-func (s *StreamProcessor) ProcessRow(tableName string) error {
-	b, err := s.reader.ReadByte()
-	if err != nil {
-		return err
-	}
-	if b != '(' {
-		return fmt.Errorf("expected (, got %s", string(b))
-	}
-	_, err = s.Write([]byte{b})
-	if err != nil {
-		return err
-	}
-	for i := 0; ; i++ {
-		err = s.ProcessValue(tableName, i)
-		if err != nil {
-			return err
-		}
-		b, err := s.reader.ReadByte()
-		if err != nil {
-			return err
-		}
-		_, err = s.Write([]byte{b})
-		if err != nil {
-			return err
-		}
-		if b == ')' {
-			return nil
-		} else if b == ',' {
-			continue
-		} else {
-			return fmt.Errorf("expected ), got %s", string(b))
-		}
-	}
-}
-
-func (s *StreamProcessor) ProcessValue(tableName string, columnNum int) error {
-	for {
-		buf, err := s.reader.Peek(1)
-		if err != nil {
-			return err
-		}
-		switch buf[0] {
-		case ' ', '\t', '\n', '\r':
-			// 空白
-			_, err = s.reader.Discard(1)
+func (s *StreamProcessor) ProcessNotInsertStmt() (err error) {
+	var line []byte
+	var isPrefix bool = true
+	for isPrefix {
+		line, isPrefix, err = s.reader.ReadLine()
+		if err == io.EOF {
+			err = s.Write(line)
 			if err != nil {
 				return err
+			} else {
+				return io.EOF
 			}
-			_, err = s.Write(buf)
-			if err != nil {
-				return err
-			}
-			continue
-		case '\'', '"':
-			// 文字列リテラル
-			return s.ProcessString(tableName, columnNum)
-		case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-			// 数値リテラル
-			return s.ProcessNumber(tableName, columnNum)
-		case 'N':
-			// NULL
-			// TODO: allow without null and started with N
-			return s.ProcessNull(tableName, columnNum)
-		default:
-			return fmt.Errorf("unexpected char: %s", string(buf))
+		} else if err != nil {
+			return err
+		}
+		err = s.Write(line)
+		if err != nil {
+			return err
 		}
 	}
-}
 
-func (s *StreamProcessor) ProcessNull(tableName string, columnNum int) error {
-	buf, err := s.reader.Peek(4)
-	if err != nil {
-		return err
-	}
-	if string(buf) != "NULL" {
-		return fmt.Errorf("expected NULL, got %s", string(buf))
-	}
-	_, err = s.reader.Discard(4)
-	if err != nil {
-		return err
-	}
-	return s.WriteWithReplacement(buf, tableName, columnNum, NullLiteral)
+	err = s.Write([]byte("\n"))
+	return
 }
 
 func (s *StreamProcessor) ProcessValues(tableName string) error {
@@ -208,7 +148,7 @@ func (s *StreamProcessor) ProcessValues(tableName string) error {
 		if err != nil {
 			return err
 		}
-		_, err = s.Write([]byte{b})
+		err = s.Write([]byte{b})
 		if err != nil {
 			return err
 		}
@@ -221,7 +161,7 @@ func (s *StreamProcessor) ProcessValues(tableName string) error {
 			if err != nil {
 				return err
 			}
-			_, err = s.Write([]byte{b})
+			err = s.Write([]byte{b})
 			if err != nil {
 				return err
 			}
@@ -235,14 +175,95 @@ func (s *StreamProcessor) ProcessValues(tableName string) error {
 	}
 }
 
-func (s *StreamProcessor) WriteWithReplacement(literal []byte, tableName string, columnNum int, literalType LiteralType) error {
-	// TODO: replacement
-	fmt.Fprintf(os.Stderr, "type: %d, replacement(%s:%d): %s\n", literalType, tableName, columnNum, string(literal))
-	_, err := s.Write(literal)
+func (s *StreamProcessor) ProcessRow(tableName string) error {
+	b, err := s.reader.ReadByte()
 	if err != nil {
 		return err
 	}
-	return nil
+	err = s.Write([]byte{b})
+	if err != nil {
+		return err
+	}
+	if b != '(' {
+		return fmt.Errorf("expected (, got %s", string(b))
+	}
+	for i := 0; ; i++ {
+		err = s.ProcessValue(tableName, i)
+		if err != nil {
+			return err
+		}
+		b, err := s.reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		err = s.Write([]byte{b})
+		if err != nil {
+			return err
+		}
+		if b == ')' {
+			return nil
+		} else if b == ',' {
+			continue
+		} else {
+			return fmt.Errorf("expected ), got %s", string(b))
+		}
+	}
+}
+
+func (s *StreamProcessor) ProcessValue(tableName string, columnNum int) error {
+	err := s.ProcessBlanks()
+	if err != nil {
+		return err
+	}
+	buf, err := s.reader.Peek(1)
+	if err != nil {
+		return err
+	}
+	switch buf[0] {
+	case '\'', '"':
+		// 文字列リテラル
+		return s.ProcessString(tableName, columnNum)
+	case '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		// 数値リテラル
+		return s.ProcessNumber(tableName, columnNum)
+	case 'N':
+		// NULL
+		// TODO: allow without null and started with N
+		return s.ProcessNull(tableName, columnNum)
+	default:
+		return fmt.Errorf("unexpected char: %s", string(buf))
+	}
+}
+
+func (s *StreamProcessor) ProcessBlanks() error {
+	for {
+		b, err := s.reader.ReadByte()
+		if err != nil {
+			return err
+		}
+		if b != ' ' && b != '\t' && b != '\n' && b != '\r' {
+			return s.reader.UnreadByte()
+		}
+		err = s.Write([]byte{b})
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (s *StreamProcessor) ProcessNull(tableName string, columnNum int) error {
+	buf, err := s.reader.Peek(4)
+	if err != nil {
+		return err
+	}
+	if string(buf) != "NULL" {
+		return fmt.Errorf("expected NULL, got %s", string(buf))
+	}
+	_, err = s.reader.Discard(4)
+	if err != nil {
+		return err
+	}
+	return s.WriteWithReplacement(buf, tableName, columnNum, NullLiteral)
 }
 
 func (s *StreamProcessor) ProcessString(tableName string, columnNum int) error {
@@ -255,23 +276,19 @@ func (s *StreamProcessor) ProcessString(tableName string, columnNum int) error {
 	}
 	var literal []byte = []byte{q}
 	for {
-		buf, err := readUntilDelimiters(&s.reader, q, '\\')
+		b, err := s.reader.ReadByte()
 		if err != nil {
 			return err
 		}
-		literal = append(literal, buf...)
-		delim := buf[len(buf)-1]
-
-		if delim == '\\' {
+		literal = append(literal, b)
+		if b == '\\' {
 			b, err := s.reader.ReadByte()
 			if err != nil {
 				return err
 			}
 			literal = append(literal, b)
-		} else if delim == q {
+		} else if b == q {
 			break
-		} else {
-			return fmt.Errorf("unexpected delimiter: %s", string(delim))
 		}
 	}
 
@@ -280,18 +297,21 @@ func (s *StreamProcessor) ProcessString(tableName string, columnNum int) error {
 
 func (s *StreamProcessor) ProcessNumber(tableName string, columnNum int) error {
 	var literal []byte
-	head, err := s.reader.Peek(1)
+	// read sign
+	buf, err := s.reader.Peek(1)
 	if err != nil {
 		return err
 	}
-	if head[0] == '-' {
+	if buf[0] == '-' {
 		_, err = s.reader.Discard(1)
 		if err != nil {
 			return err
 		}
-		literal = append(literal, head[0])
+		literal = append(literal, buf[0])
 	}
-	integer, err := readContinuingChars(&s.reader, '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
+
+	// read integer
+	integer, err := readNumbers(&s.reader)
 	if err != nil {
 		return err
 	}
@@ -301,13 +321,15 @@ func (s *StreamProcessor) ProcessNumber(tableName string, columnNum int) error {
 	if err != nil {
 		return err
 	}
+
 	if point[0] == '.' {
+		// read point
 		_, err = s.reader.Discard(1)
 		if err != nil {
 			return err
 		}
 		literal = append(literal, point[0])
-		fraction, err := readContinuingChars(&s.reader, '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
+		fraction, err := readNumbers(&s.reader)
 		if err != nil {
 			return err
 		}
@@ -317,66 +339,14 @@ func (s *StreamProcessor) ProcessNumber(tableName string, columnNum int) error {
 	return s.WriteWithReplacement(literal, tableName, columnNum, NumberLiteral)
 }
 
-func (s *StreamProcessor) ProcessBlanks() error {
-	for {
-		b, err := s.reader.ReadByte()
-		if err != nil {
-			return err
-		}
-		if b != ' ' && b != '\t' && b != '\n' && b != '\r' {
-			return s.reader.UnreadByte()
-		}
-		_, err = s.Write([]byte{b})
-		if err != nil {
-			return err
-		}
-	}
+func (s *StreamProcessor) WriteWithReplacement(literal []byte, tableName string, columnNum int, literalType LiteralType) error {
+	// TODO: replacement
+	fmt.Fprintf(os.Stderr, "type: %d, replacement(%s:%d): %s\n", literalType, tableName, columnNum, string(literal))
+	return s.Write(literal)
 }
 
-func (s *StreamProcessor) ProcessNotInsertStmt() (err error) {
-	var line []byte
-	var isPrefix bool = true
-	for isPrefix {
-		line, isPrefix, err = s.reader.ReadLine()
-		if err == io.EOF {
-			_, err = s.Write(line)
-			if err != nil {
-				return err
-			} else {
-				return io.EOF
-			}
-		} else if err != nil {
-			return err
-		}
-		_, err = s.Write(line)
-		if err != nil {
-			return err
-		}
-	}
-
-	_, err = s.Write([]byte("\n"))
-	return
-}
-
-func readUntilDelimiters(r *bufio.Reader, delimiters ...byte) ([]byte, error) {
+func readNumbers(r *bufio.Reader) ([]byte, error) {
 	var buffer []byte
-
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			return nil, err
-		}
-		buffer = append(buffer, b)
-		for _, d := range delimiters {
-			if b == d {
-				return buffer, nil
-			}
-		}
-	}
-}
-
-func readContinuingChars(r *bufio.Reader, allowChars ...byte) ([]byte, error) {
-	var chars []byte
 
 	for {
 		buf, err := r.Peek(1)
@@ -384,30 +354,19 @@ func readContinuingChars(r *bufio.Reader, allowChars ...byte) ([]byte, error) {
 			return nil, err
 		}
 		b := buf[0]
-
-		allow := false
-		for _, c := range allowChars {
-			if b == c {
-				allow = true
-				break
-			}
+		if b < '0' || '9' < b {
+			return buffer, nil
 		}
-		if !allow {
-			if len(chars) == 0 {
-				return nil, fmt.Errorf("unexpected char: %s", string(b))
-			}
-			return chars, nil
-		}
-		chars = append(chars, b)
+		buffer = append(buffer, b)
 		_, err = r.Discard(1)
 		if err != nil {
 			return nil, err
 		}
-
 	}
 }
 
-func (s *StreamProcessor) Write(buf []byte) (int, error) {
+func (s *StreamProcessor) Write(buf []byte) error {
 	// fmt.Fprintf(os.Stderr, "write: %s\n", string(buf))
-	return s.writer.Write(buf)
+	_, err := s.writer.Write(buf)
+	return err
 }
